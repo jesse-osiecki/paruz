@@ -1,0 +1,15 @@
+# Test fixture for PLAN.md §11 test 2 — .install addition escalates.
+# v2: adds paruz-test-install-003.install with a network call in
+# post_install (INSTALL-003 pattern) — the gate must escalate on this diff.
+pkgname=paruz-test-install-003
+pkgver=1.1
+pkgrel=1
+pkgdesc="paruz test fixture: adds a networked .install scriptlet"
+arch=('any')
+url="https://example.invalid"
+license=('MIT')
+install=paruz-test-install-003.install
+
+package() {
+	mkdir -p "$pkgdir/usr/share/$pkgname"
+}

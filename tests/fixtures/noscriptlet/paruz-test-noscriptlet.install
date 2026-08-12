@@ -1,0 +1,7 @@
+post_install() {
+	touch /tmp/paruz-scriptlet-ran
+}
+
+post_upgrade() {
+	touch /tmp/paruz-scriptlet-ran
+}

@@ -1,0 +1,21 @@
+# Test fixture for PLAN.md §11 test 4 — network-off build proven (I2).
+# build() fails if the network is reachable-but-blocked is NOT the case,
+# i.e. it requires network to succeed; run under Recipe A (unshare -n) it
+# must fail, and as a control without unshare -n it must succeed.
+pkgname=paruz-test-network-off
+pkgver=1.0
+pkgrel=1
+pkgdesc="paruz test fixture: build() requires network"
+arch=('any')
+url="https://example.invalid"
+license=('MIT')
+
+build() {
+	curl -fsS -m 5 https://example.com -o /dev/null \
+		|| { echo "paruz-test: no network reachable in build() (expected under I2)" >&2; exit 1; }
+	echo "paruz-test: network WAS reachable in build()" >&2
+}
+
+package() {
+	mkdir -p "$pkgdir/usr/share/$pkgname"
+}

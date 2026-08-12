@@ -1,0 +1,24 @@
+# paruz — known-compromised AUR packages (IOC self-check)
+#
+# POINT-IN-TIME, ADVISORY list. A match means "this name was reported compromised
+# during a known AUR attack wave" — investigate, rotate credentials, and consider a
+# reinstall if it ran as root. Absence here is NOT evidence of safety.
+#
+# Format: one package name per line; '#' comments and blank lines ignored.
+# Keep this updated from trusted advisories; paruz treats it as data, not gospel.
+
+# --- Wave 2 (ELF / RAT + SSH-worm wave, late Jul–Aug 2026): confirmed affected ---
+boringssl-git
+icloudpd
+windscribe-cli-v2-bin
+stirling-pdf-desktop-bin
+openconnect-sso
+arduino-language-server-noclang-bin
+pgadmin4-server
+
+# --- Wave 1 ("Atomic Arch", Jun 2026): payload-fetch marker package names ---
+# (Injected build/scriptlet steps referenced these npm/bun packages; listed as
+#  install-name heuristics, not necessarily AUR package names.)
+# atomic-lockfile
+# js-digest
+# lockfile-js

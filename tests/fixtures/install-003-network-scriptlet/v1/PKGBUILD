@@ -1,0 +1,13 @@
+# Test fixture for PLAN.md §11 test 2 — .install addition escalates.
+# v1: baseline, no .install. See ../v2 for the update that adds one.
+pkgname=paruz-test-install-003
+pkgver=1.0
+pkgrel=1
+pkgdesc="paruz test fixture: baseline, no .install"
+arch=('any')
+url="https://example.invalid"
+license=('MIT')
+
+package() {
+	mkdir -p "$pkgdir/usr/share/$pkgname"
+}

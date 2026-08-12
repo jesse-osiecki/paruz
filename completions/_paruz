@@ -1,0 +1,48 @@
+#compdef paruz
+# SPDX-License-Identifier: GPL-3.0-or-later
+# zsh completion for paruz
+
+_paruz() {
+	local -a ops flags
+	ops=(
+		'-S:hardened AUR/repo install'
+		'-Syu:hardened full upgrade'
+		'-Su:hardened full upgrade'
+		'-Sua:hardened AUR-only upgrade'
+		'-Q:passthrough query'
+		'-Qua:passthrough list AUR updates'
+		'-R:passthrough remove'
+		'-Ss:passthrough search'
+		'-Si:passthrough info'
+		'-G:passthrough get PKGBUILD'
+		'-F:passthrough file query'
+		'-Sc:passthrough clean cache'
+		'doctor:verify environment'
+	)
+	flags=(
+		'--fail-on[aur-scan gate threshold]:level:(critical high medium low info)'
+		'--allow-maintainer-change[permit a maintainer change for this run]'
+		'--replay-hook[advisory sandbox replay of a scriptlet function]::fn:(pre_install post_install pre_upgrade post_upgrade pre_remove post_remove)'
+		'--no-flatpak[skip flatpak update on upgrades]'
+		'--no-ioc[skip the IOC self-check]'
+		'--sandbox[build backend]:backend:(chroot gvisor)'
+		'--dry-run[print the plan without executing]'
+		'--help[show help]'
+		'--version[print version]'
+	)
+	_arguments -s -S \
+		$flags \
+		'1: :->op' \
+		'*: :->rest'
+
+	case "$state" in
+		op)
+			_describe -t operations 'paruz operation' ops
+			;;
+		rest)
+			_files
+			;;
+	esac
+}
+
+_paruz "$@"

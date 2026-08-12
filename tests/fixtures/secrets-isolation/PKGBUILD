@@ -1,0 +1,22 @@
+# Test fixture for PLAN.md §11 test 6 — secrets isolation (I3).
+# build() fails if it can see any ssh keys — the build namespace must never
+# have $HOME/~/.ssh bind-mounted in.
+pkgname=paruz-test-secrets
+pkgver=1.0
+pkgrel=1
+pkgdesc="paruz test fixture: build() must not see ~/.ssh"
+arch=('any')
+url="https://example.invalid"
+license=('MIT')
+
+build() {
+	if compgen -G "$HOME/.ssh/id_*" > /dev/null 2>&1; then
+		echo "paruz-test: SECRET LEAK — found ssh keys visible inside the build" >&2
+		exit 1
+	fi
+	echo "paruz-test: no ssh keys visible (expected under I3)" >&2
+}
+
+package() {
+	mkdir -p "$pkgdir/usr/share/$pkgname"
+}

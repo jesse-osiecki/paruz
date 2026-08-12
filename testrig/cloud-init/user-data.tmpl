@@ -1,0 +1,27 @@
+#cloud-config
+# NoCloud user-data for the paruz disposable test rig. Templated by
+# build-base.sh, which substitutes __SSH_PUBKEY__ with the rig's own
+# dedicated keypair (testrig/README.md — never the operator's real
+# ~/.ssh keys). Deliberately minimal: only what's needed to get an SSH
+# login with sudo. All Arch-specific bring-up (keyring, base-devel, paru,
+# paruz-setup) happens explicitly over SSH from build-base.sh, not here,
+# so it's visible/loggable/retryable on the host side rather than buried
+# in a first-boot cloud-init log inside the guest.
+
+hostname: paruz-testrig
+disable_root: true
+ssh_pwauth: false
+
+users:
+  - name: arch
+    groups: [wheel]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+
+runcmd:
+  - [ systemctl, enable, --now, sshd ]
+
+final_message: "paruz-testrig cloud-init finished after $UPTIME seconds"

@@ -1,0 +1,16 @@
+# build artifacts / local state — never commit built packages or fetched sources
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+srcdest/
+work/
+*.log
+
+# makepkg build dirs (from building the PKGBUILD in-tree)
+/pkg/
+/src/
+/paruz/
+/paruz-git/
+
+# editor / OS cruft
+*.swp
+.DS_Store

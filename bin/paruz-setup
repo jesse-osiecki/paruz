@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# paruz-setup — idempotent, re-runnable bootstrap for paruz (PLAN.md §8).
+# Prints what it changes and asks before touching system files. Safe to
+# run repeatedly: every step is grep/existence-guarded.
+set -euo pipefail
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+REPO_ROOT=$(dirname "$SCRIPT_DIR")
+
+# Resolve our lib/*.sh, supporting both a source checkout (bin/ and lib/
+# siblings) and an installed package (/usr/lib/paruz/lib). Mirrors bin/paruz.
+resolve_lib_dir() {
+	local c
+	for c in "${PARUZ_LIB_DIR:-}" \
+		"$REPO_ROOT/lib" \
+		"$SCRIPT_DIR/../lib/paruz/lib" \
+		/usr/lib/paruz/lib \
+		/usr/share/paruz/lib; do
+		[[ -n "$c" && -f "$c/common.sh" ]] && { printf '%s\n' "$c"; return 0; }
+	done
+	echo "paruz-setup: cannot locate lib/common.sh" >&2
+	exit 1
+}
+LIB_DIR=$(resolve_lib_dir)
+# shellcheck source=lib/common.sh
+source "$LIB_DIR/common.sh"
+
+# is_source_checkout — true when running from a git/source checkout (bin/ and
+# lib/ siblings with the scripts in place), false when running from an
+# installed package (files owned by pacman / placed by 'make install').
+is_source_checkout() { [[ -f "$REPO_ROOT/lib/common.sh" && -f "$REPO_ROOT/bin/paruz" ]]; }
+
+DRY_RUN=0
+YES=0
+UNINSTALL=0
+
+usage() {
+	cat <<'EOF'
+paruz-setup — idempotent bootstrap for paruz (PLAN.md §8)
+
+Usage: paruz-setup [--dry-run] [--yes] [--uninstall] [-h|--help]
+
+  --dry-run     print what would change without doing it
+  --yes, -y     don't prompt; assume yes to every step
+  --uninstall   best-effort teardown: remove the [aur] block, local repo,
+                chroot, and /var/lib/paruz (destructive; prompts per step
+                unless combined with --yes)
+EOF
+}
+
+while (( $# > 0 )); do
+	case "$1" in
+		--dry-run) DRY_RUN=1; shift ;;
+		--yes|-y) YES=1; shift ;;
+		--uninstall) UNINSTALL=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown argument: $1" ;;
+	esac
+done
+
+confirm_step() {
+	local prompt="$1" default="${2:-y}"
+	(( YES )) && return 0
+	confirm "$prompt" "$default"
+}
+
+# --- steps (PLAN.md §8) --------------------------------------------------
+
+setup_check_platform() {
+	command -v pacman >/dev/null 2>&1 || die "pacman not found — paruz-setup targets Arch Linux"
+}
+
+setup_install_deps() {
+	local pkgs=(devtools flatpak jq expac bpf git curl)
+	log "step 1/8: core dependencies: ${pkgs[*]}"
+	run sudo pacman -S --needed --noconfirm "${pkgs[@]}"
+
+	command -v paru >/dev/null 2>&1 \
+		|| die "paru not found — install an AUR helper (paru) first; paruz orchestrates it, it does not bootstrap it"
+
+	if ! command -v aur-scan >/dev/null 2>&1; then
+		warn "ks-aur-scanner (aur-scan) not found — paruz's gate REQUIRES it and fails closed without it"
+		if confirm_step "Bootstrap ks-aur-scanner now via 'paru -S ks-aur-scanner' (one-time, unhardened bootstrap)?" y; then
+			run command paru -S --noconfirm ks-aur-scanner
+		else
+			warn "skipping — install ks-aur-scanner manually before using paruz"
+		fi
+	fi
+}
+
+setup_local_repo() {
+	log "step 2/8: local repo at $AUR_REPO_DIR"
+	if [[ -d "$AUR_REPO_DIR" && -f "$AUR_REPO_DIR/aur.db.tar.zst" ]]; then
+		log "  already initialized"
+		return 0
+	fi
+	run sudo mkdir -p "$AUR_REPO_DIR"
+	run sudo chgrp wheel "$AUR_REPO_DIR"
+	run sudo chmod g+w "$AUR_REPO_DIR"
+	run sudo repo-add "$AUR_REPO_DIR/aur.db.tar.zst"
+}
+
+setup_chroot() {
+	log "step 3/8: build chroot at $AUR_CHROOT_ROOT/root"
+	if [[ -d "$AUR_CHROOT_ROOT/root" ]]; then
+		log "  already exists"
+	else
+		run sudo mkdir -p "$AUR_CHROOT_ROOT"
+		run sudo mkarchroot "$AUR_CHROOT_ROOT/root" base-devel
+	fi
+	if findmnt -no FSTYPE "$AUR_CHROOT_ROOT" 2>/dev/null | grep -qx btrfs; then
+		log "  $AUR_CHROOT_ROOT is on btrfs — chroot copies will use subvolume snapshots"
+	fi
+	if [[ -d "$AUR_SRCPOOL" ]]; then
+		log "  $AUR_SRCPOOL already exists"
+	else
+		run sudo mkdir -p "$AUR_SRCPOOL"
+	fi
+	# Owned by the invoking user (not root): lib/build.sh bind-mounts this into
+	# the chroot copy as builduser's $SRCDEST and writes to it as that
+	# non-root uid — see build_provision_sources()/build_create_builduser().
+	run sudo chown "${SUDO_USER:-$(id -un)}:${SUDO_USER:-$(id -un)}" "$AUR_SRCPOOL"
+}
+
+setup_pacman_conf() {
+	local conf=/etc/pacman.conf
+	log "step 4/8: [aur] repo in $conf"
+	if grep -q '^\[aur\]' "$conf" 2>/dev/null; then
+		log "  already configured"
+		return 0
+	fi
+	confirm_step "Append [aur] repo block to $conf?" y || { warn "skipping — paruz requires [aur] configured"; return 0; }
+
+	local block=$'\n[aur]\nSigLevel = Optional TrustAll\nServer = file:///var/lib/repo/aur\n'
+	if (( DRY_RUN )); then
+		log "  [dry-run] would append to $conf:"
+		printf '%s\n' "$block" >&2
+	else
+		printf '%s' "$block" | sudo tee -a "$conf" >/dev/null
+		run sudo pacman -Sy
+	fi
+}
+
+setup_paru_conf() {
+	local conf="${XDG_CONFIG_HOME:-$HOME/.config}/paru/paru.conf"
+	log "step 5/8: paru.conf ($conf)"
+	mkdir -p "$(dirname "$conf")"
+
+	local header_count=0
+	[[ -f "$conf" ]] && header_count=$(grep -c '^\[options\]' "$conf" || true)
+	if [[ -f "$conf" ]] && (( header_count == 1 )) \
+		&& grep -q '^LocalRepo *= *aur *$' "$conf" \
+		&& grep -qF "Chroot = $AUR_CHROOT_ROOT" "$conf"; then
+		log "  already clean and configured"
+		return 0
+	fi
+
+	confirm_step "(Re)write a single clean [options] block in $conf (LocalRepo=aur, Chroot=$AUR_CHROOT_ROOT)?" y \
+		|| { warn "skipping paru.conf change"; return 0; }
+
+	local tmp
+	tmp=$(mktemp)
+	{
+		echo "[options]"
+		if [[ -f "$conf" ]]; then
+			grep -vE '^\[options\] *$|^LocalRepo *=|^Chroot *=' "$conf" | awk '!seen[$0]++'
+		fi
+		echo "LocalRepo = aur"
+		echo "Chroot = $AUR_CHROOT_ROOT"
+	} > "$tmp"
+
+	if (( DRY_RUN )); then
+		log "  [dry-run] would write $conf:"
+		cat "$tmp" >&2
+		rm -f "$tmp"
+	else
+		mv "$tmp" "$conf"
+		ok "  wrote $conf"
+	fi
+}
+
+setup_scanner_integration() {
+	log "step 6/8: ks-aur-scanner shell integration (non-gating — PLAN.md §3.8)"
+	[[ -r /usr/share/aur-scan/integration.zsh ]] || { log "  not installed, nothing to do"; return 0; }
+
+	local rc="${ZDOTDIR:-$HOME}/.zshrc"
+	if [[ -f "$rc" ]] && grep -q 'AUR_SCAN_ENABLED=0' "$rc"; then
+		log "  already disabled in $rc"
+		return 0
+	fi
+
+	warn "ks-aur-scanner's zsh integration wraps paru()/yay() but runs 'aur-scan check' WITHOUT --fail-on — it never blocks."
+	confirm_step "Append 'export AUR_SCAN_ENABLED=0' to $rc so paruz's own gate stays the single source of truth?" y \
+		|| { warn "skipping — you'll have two scan layers (paruz's gate is still authoritative)"; return 0; }
+
+	if (( DRY_RUN )); then
+		log "  [dry-run] would append AUR_SCAN_ENABLED=0 to $rc"
+	else
+		{
+			printf '\n# disabled by paruz-setup: paruz'"'"'s own gate (aur-scan scan --fail-on) is authoritative\n'
+			printf 'export AUR_SCAN_ENABLED=0\n'
+		} >> "$rc"
+		ok "  updated $rc"
+	fi
+}
+
+setup_install_paruz() {
+	log "step 7/8: paruz files"
+	if ! is_source_checkout; then
+		log "  installed via package ('make install' / pacman) — files already in place, nothing to do"
+		return 0
+	fi
+
+	# Source-checkout convenience install: symlink the checkout into the
+	# system so 'paruz' is on PATH for dev/testing. For a real install,
+	# prefer the pacman package (see PKGBUILD) or 'sudo make install' — those
+	# place package-owned copies instead of symlinks into your working tree.
+	warn "  running from a source checkout — installing dev symlinks into /usr/local/bin"
+	warn "  (for a real install, build the pacman package or run 'sudo make install' instead)"
+	local dest_bin=/usr/local/bin
+	run sudo ln -sf "$REPO_ROOT/bin/paruz" "$dest_bin/paruz"
+	run sudo ln -sf "$REPO_ROOT/bin/paruz-setup" "$dest_bin/paruz-setup"
+
+	local comp_bash=/usr/share/bash-completion/completions
+	local comp_zsh=/usr/share/zsh/site-functions
+	[[ -d "$comp_bash" ]] && run sudo ln -sf "$REPO_ROOT/completions/paruz.bash" "$comp_bash/paruz"
+	[[ -d "$comp_zsh" ]] && run sudo ln -sf "$REPO_ROOT/completions/_paruz" "$comp_zsh/_paruz"
+
+	run sudo mkdir -p /etc/paruz /usr/share/paruz
+	if [[ ! -f /etc/paruz/paruz.conf ]]; then
+		run sudo cp "$REPO_ROOT/etc/paruz.conf" /etc/paruz/paruz.conf
+	fi
+	run sudo cp "$REPO_ROOT/share/known-bad-packages.txt" /usr/share/paruz/known-bad-packages.txt
+}
+
+setup_selftest() {
+	log "step 8/8: self-test (paruz doctor)"
+	if (( DRY_RUN )); then
+		log "  [dry-run] would run: paruz doctor"
+		return 0
+	fi
+	if is_source_checkout; then
+		PARUZ_LIB_DIR="$REPO_ROOT/lib" "$REPO_ROOT/bin/paruz" doctor \
+			|| warn "doctor reported missing items (see above) — re-run paruz-setup after resolving them"
+	else
+		paruz doctor \
+			|| warn "doctor reported missing items (see above) — re-run paruz-setup after resolving them"
+	fi
+}
+
+# --- teardown -------------------------------------------------------------
+
+cmd_uninstall() {
+	warn "uninstall is best-effort and destructive. Nothing here touches packages you've already installed."
+
+	if confirm_step "Remove the [aur] block from /etc/pacman.conf?" n; then
+		if (( DRY_RUN )); then
+			log "  [dry-run] would remove [aur] block from /etc/pacman.conf"
+		else
+			run sudo sed -i '/^\[aur\]$/,/^$/d' /etc/pacman.conf
+		fi
+	fi
+	if confirm_step "Remove local repo $AUR_REPO_DIR?" n; then
+		run sudo rm -rf "$AUR_REPO_DIR"
+	fi
+	if confirm_step "Remove build chroot $AUR_CHROOT_ROOT?" n; then
+		run sudo rm -rf "$AUR_CHROOT_ROOT"
+	fi
+	if confirm_step "Remove /var/lib/paruz (source pool)?" n; then
+		run sudo rm -rf /var/lib/paruz
+	fi
+	# Only remove dev symlinks we created from a source checkout. Package-owned
+	# files (from 'make install' / pacman) are removed by 'pacman -R paruz',
+	# NOT here — deleting them out from under the package manager would leave
+	# its database inconsistent.
+	if [[ -L /usr/local/bin/paruz || -L /usr/local/bin/paruz-setup ]]; then
+		if confirm_step "Remove paruz dev symlinks from /usr/local/bin and /usr/share/{bash-completion,zsh}?" n; then
+			run sudo rm -f /usr/local/bin/paruz /usr/local/bin/paruz-setup
+			run sudo rm -f /usr/share/bash-completion/completions/paruz /usr/share/zsh/site-functions/_paruz
+		fi
+	else
+		log "no paruz dev symlinks found in /usr/local/bin — if installed via package, remove with 'pacman -R paruz'"
+	fi
+	ok "teardown steps complete (skipped steps left untouched)"
+}
+
+main() {
+	setup_check_platform
+	if (( UNINSTALL )); then
+		cmd_uninstall
+		return 0
+	fi
+	setup_install_deps
+	setup_local_repo
+	setup_chroot
+	setup_pacman_conf
+	setup_paru_conf
+	setup_scanner_integration
+	setup_install_paruz
+	setup_selftest
+	ok "paruz-setup complete"
+}
+
+main

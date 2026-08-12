@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# paruz — zero-trust AUR installer. Hardened wrapper around stock paru/pacman.
+# See PLAN.md for the full design; this file is the entrypoint: arg parsing,
+# passthrough detection, and orchestration of lib/*.sh (PLAN.md §4-§5).
+set -euo pipefail
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+
+resolve_lib_dir() {
+	# Candidate order: explicit override; repo layout (bin/ and lib/ are
+	# siblings); PREFIX-relative installed layout (e.g. /usr/bin/paruz ->
+	# /usr/lib/paruz/lib, works for any --prefix); and the two absolute
+	# fallbacks the Makefile installs to by default.
+	local c
+	for c in "${PARUZ_LIB_DIR:-}" \
+		"$SCRIPT_DIR/../lib" \
+		"$SCRIPT_DIR/../lib/paruz/lib" \
+		/usr/lib/paruz/lib \
+		/usr/share/paruz/lib; do
+		[[ -n "$c" && -f "$c/common.sh" ]] && { printf '%s\n' "$c"; return 0; }
+	done
+	echo "paruz: cannot locate lib/common.sh (checked \$PARUZ_LIB_DIR, $SCRIPT_DIR/../lib, $SCRIPT_DIR/../lib/paruz/lib, /usr/lib/paruz/lib, /usr/share/paruz/lib)" >&2
+	exit 1
+}
+LIB_DIR=$(resolve_lib_dir)
+# shellcheck source=lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=lib/ioc.sh
+source "$LIB_DIR/ioc.sh"
+# shellcheck source=lib/gate.sh
+source "$LIB_DIR/gate.sh"
+# shellcheck source=lib/build.sh
+source "$LIB_DIR/build.sh"
+# shellcheck source=lib/install.sh
+source "$LIB_DIR/install.sh"
+
+load_config
+
+VERSION=0.1.0
+DRY_RUN=0
+
+usage() {
+	cat <<'EOF'
+paruz — zero-trust AUR installer (hardened wrapper around paru/pacman)
+
+Usage:
+  paruz -S <pkg...>        Hardened AUR install (official-repo targets pass through)
+  paruz [-Syu|-Su|(bare)]  Hardened full upgrade: repo -> AUR -> flatpak
+  paruz -Sua               Hardened AUR-only upgrade
+  paruz doctor              Verify environment (PLAN.md §3, §9.2)
+  paruz <anything else>     Passed straight through to `paru` unchanged
+
+Only the canonical forms above are recognized for hardening; anything else
+(including uncommon pacman flag combinations) passes straight through to
+stock paru with no gating. See PLAN.md §4.
+
+paruz-specific flags (stripped before delegating passthrough ops):
+  --fail-on <level>            aur-scan gate threshold (default: critical)
+  --allow-maintainer-change    permit a maintainer change for this run
+  --replay-hook[=FN]           advisory sandbox replay of a scriptlet function
+                                (FN: pre_install|post_install|pre_upgrade|
+                                post_upgrade|pre_remove|post_remove)
+  --no-flatpak                 skip `flatpak update` on upgrades
+  --no-ioc                     skip the IOC self-check
+  --sandbox=chroot|gvisor      build backend (default: chroot; gvisor is Phase 2)
+  --dry-run                    print the plan without executing
+  -h, --help                   this help
+  --version                    print version
+
+paruz never calls a shell function named paru/pacman — it always uses
+`command paru` / absolute pacman, so it is unaffected by any zsh paru()
+wrapper and never re-triggers ks-aur-scanner's non-gating shell integration.
+EOF
+}
+
+cmd_doctor() {
+	local ok_count=0 fail_count=0
+	check() {
+		local desc="$1"; shift
+		if "$@" >/dev/null 2>&1; then
+			ok "$desc"
+			ok_count=$((ok_count + 1))
+		else
+			err "MISSING: $desc"
+			fail_count=$((fail_count + 1))
+		fi
+	}
+
+	log "paruz doctor — verifying environment (PLAN.md §3, §9.2)"
+	check "command paru on PATH"       command -v paru
+	check "pacman on PATH"             command -v pacman
+	check "makechrootpkg on PATH"      command -v makechrootpkg
+	check "arch-nspawn on PATH"        command -v arch-nspawn
+	check "mkarchroot on PATH"         command -v mkarchroot
+	check "repo-add on PATH"           command -v repo-add
+	check "aur-scan on PATH"           command -v aur-scan
+	check "jq on PATH"                 command -v jq
+	check "curl on PATH"               command -v curl
+	check "git on PATH"                command -v git
+	check "bsdtar on PATH"             command -v bsdtar
+	check "unshare on PATH"            command -v unshare
+	check "bwrap on PATH"              command -v bwrap
+	check "expac on PATH"              command -v expac
+	check "bpftool on PATH (IOC eBPF check)" command -v bpftool
+	check "flatpak on PATH"            command -v flatpak
+	# $1 below is the inner script's positional arg, must not expand here
+	# shellcheck disable=SC2016
+	check "$AUR_REPO_DIR exists and writable" \
+		bash -c '[[ -d "$1" && -w "$1" ]]' _ "$AUR_REPO_DIR"
+	check "$AUR_CHROOT_ROOT/root exists" \
+		test -d "$AUR_CHROOT_ROOT/root"
+	check "[aur] configured in /etc/pacman.conf" \
+		grep -q '^\[aur\]' /etc/pacman.conf
+	check "known-bad package list readable ($KNOWN_BAD_LIST)" \
+		test -r "$KNOWN_BAD_LIST"
+
+	log "doctor: $ok_count OK, $fail_count missing"
+	if (( fail_count > 0 )); then
+		log "run 'paruz-setup' to fix missing items"
+		return 1
+	fi
+	return 0
+}
+
+# --- arg parsing --------------------------------------------------------
+
+ARGS=()
+REPLAY_HOOK=""
+CLI_FAIL_ON=""
+CLI_ALLOW_MAINTAINER_CHANGE=0
+CLI_SANDBOX=""
+CLI_NO_FLATPAK=0
+CLI_NO_IOC=0
+
+while (( $# > 0 )); do
+	case "$1" in
+		--fail-on) CLI_FAIL_ON="$2"; shift 2 ;;
+		--fail-on=*) CLI_FAIL_ON="${1#*=}"; shift ;;
+		--allow-maintainer-change) CLI_ALLOW_MAINTAINER_CHANGE=1; shift ;;
+		--replay-hook) REPLAY_HOOK="post_install"; shift ;;
+		--replay-hook=*) REPLAY_HOOK="${1#*=}"; shift ;;
+		--no-flatpak) CLI_NO_FLATPAK=1; shift ;;
+		--no-ioc) CLI_NO_IOC=1; shift ;;
+		--sandbox=*) CLI_SANDBOX="${1#*=}"; shift ;;
+		--dry-run) DRY_RUN=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		--version) printf 'paruz %s\n' "$VERSION"; exit 0 ;;
+		doctor) shift; cmd_doctor "$@"; exit $? ;;
+		*) ARGS+=("$1"); shift ;;
+	esac
+done
+export DRY_RUN
+
+[[ -n "$CLI_FAIL_ON" ]] && FAIL_ON="$CLI_FAIL_ON"
+(( CLI_ALLOW_MAINTAINER_CHANGE )) && ALLOW_MAINTAINER_CHANGE=1
+[[ -n "$CLI_SANDBOX" ]] && SANDBOX="$CLI_SANDBOX"
+(( CLI_NO_FLATPAK )) && FLATPAK=0
+(( CLI_NO_IOC )) && IOC=0
+
+if [[ -n "$REPLAY_HOOK" && ! "$REPLAY_HOOK" =~ ^(pre_install|post_install|pre_upgrade|post_upgrade|pre_remove|post_remove)$ ]]; then
+	die "invalid --replay-hook function: $REPLAY_HOOK"
+fi
+export REPLAY_HOOK
+
+case "$SANDBOX" in
+	chroot) : ;;
+	gvisor) die "--sandbox=gvisor is Phase 2, not implemented yet (PLAN.md §13)" ;;
+	*) die "unknown SANDBOX '$SANDBOX' (supported: chroot)" ;;
+esac
+
+# --- operation classification (PLAN.md §4) ------------------------------
+
+# process_one_target PKG — full §6.1-6.6 pipeline for a single AUR target.
+process_one_target() {
+	local t="$1" pkgbase clonedir maintainer result
+	log "=== $t ==="
+	result=$(gate_run "$t")
+	read -r pkgbase clonedir maintainer <<<"$result"
+
+	build_target "$pkgbase" "$clonedir"
+
+	local -a pkgnames
+	mapfile -t pkgnames < <(build_pkgnames "$clonedir")
+
+	ALL_AUR_NAMES=("${pkgnames[@]}")
+	EXPLICIT_AUR_FILES=()
+	DEP_AUR_FILES=()
+
+	local n f
+	for n in "${pkgnames[@]}"; do
+		f=$(build_latest_repo_file "$n")
+		[[ -n "$f" ]] || die "$pkgbase: expected built package file for $n not found in $AUR_REPO_DIR"
+		EXPLICIT_AUR_FILES+=("$f")
+	done
+
+	local dn df
+	for dn in "${AUR_DEP_NAMES[@]:-}"; do
+		[[ -z "$dn" ]] && continue
+		pacman -Qq "$dn" >/dev/null 2>&1 && continue
+		df=$(build_latest_repo_file "$dn")
+		[[ -n "$df" ]] || continue
+		ALL_AUR_NAMES+=("$dn")
+		DEP_AUR_FILES+=("$df")
+	done
+
+	install_run
+
+	gate_snapshot "$pkgbase" "$clonedir" "$maintainer"
+	ok "$pkgbase: complete"
+}
+
+run_targets_hardened() {
+	local t
+	for t in "$@"; do
+		process_one_target "$t"
+	done
+}
+
+do_flatpak() {
+	[[ "${FLATPAK:-1}" == 1 ]] || { log "flatpak update skipped (--no-flatpak/FLATPAK=0)"; return 0; }
+	if ! command -v flatpak >/dev/null 2>&1; then
+		warn "flatpak not installed — skipping"
+		return 0
+	fi
+	log "flatpak update (interactive; runs in Flatpak's own sandbox/trust model)..."
+	run flatpak update
+}
+
+aur_upgrade_targets() {
+	log "checking AUR updates (paru -Qua)..."
+	local -a updates
+	mapfile -t updates < <(command paru -Qua 2>/dev/null | awk '{print $1}')
+	if (( ${#updates[@]} == 0 )); then
+		log "no AUR updates available"
+		return 0
+	fi
+	log "AUR updates: ${updates[*]}"
+	run_targets_hardened "${updates[@]}"
+}
+
+op_upgrade_full() {
+	assert_environment
+	ioc_self_check 1
+	log "official-repo upgrade (signed, scriptlets ON)..."
+	run sudo pacman -Syu --noconfirm
+	aur_upgrade_targets
+	do_flatpak
+	ioc_self_check 0
+}
+
+op_upgrade_aur() {
+	assert_environment
+	ioc_self_check 1
+	aur_upgrade_targets
+	ioc_self_check 0
+}
+
+op_install() {
+	assert_environment
+	ioc_self_check 1
+	local -a targets=("$@") repo_targets=() aur_targets=()
+	local t repo
+	for t in "${targets[@]}"; do
+		# pacman -Si exits non-zero for AUR (non-repo) targets; the trailing
+		# `|| true` keeps that expected failure from tripping `set -o pipefail`
+		# + `set -e`. Empty $repo => treat as an AUR target.
+		repo=$(pacman -Si "$t" 2>/dev/null | awk -F': ' '/^Repository/{print $2; exit}') || true
+		if [[ -n "$repo" && "$repo" != "aur" ]]; then
+			repo_targets+=("$t")
+		else
+			aur_targets+=("$t")
+		fi
+	done
+	if (( ${#repo_targets[@]} > 0 )); then
+		log "installing official-repo target(s) normally: ${repo_targets[*]}"
+		run command paru -S --noconfirm "${repo_targets[@]}"
+	fi
+	if (( ${#aur_targets[@]} > 0 )); then
+		run_targets_hardened "${aur_targets[@]}"
+	fi
+	ioc_self_check 0
+}
+
+op_passthrough() {
+	local paru_bin
+	paru_bin=$(command -v paru) || die "paru not found on PATH"
+	exec "$paru_bin" "$@"
+}
+
+main() {
+	if (( ${#ARGS[@]} == 0 )); then
+		op_upgrade_full
+		return 0
+	fi
+
+	local flags_str="" targets=() a
+	for a in "${ARGS[@]}"; do
+		case "$a" in
+			--sync) flags_str+=S ;;
+			--refresh) flags_str+=y ;;
+			--sysupgrade) flags_str+=u ;;
+			--) : ;;
+			-[A-Za-z]*) flags_str+="${a#-}" ;;
+			*) targets+=("$a") ;;
+		esac
+	done
+
+	if [[ "$flags_str" == *S* ]]; then
+		if [[ "$flags_str" == *u* && "$flags_str" == *a* ]]; then
+			op_upgrade_aur
+			return 0
+		elif [[ "$flags_str" == *u* ]]; then
+			op_upgrade_full
+			return 0
+		elif (( ${#targets[@]} > 0 )) && [[ "$flags_str" == S || "$flags_str" == Sy ]]; then
+			op_install "${targets[@]}"
+			return 0
+		fi
+	fi
+
+	op_passthrough "${ARGS[@]}"
+}
+
+main
