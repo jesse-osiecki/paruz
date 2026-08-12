@@ -1,9 +1,10 @@
-# paruz — Zero-Trust AUR Installer: Implementation Plan
+# paruz — Zero-Trust AUR Installer: Design & Security Invariants
 
-> **Status:** specification, ready to implement.
-> **Audience:** an implementer (human or model) with access to this repo but **not**
-> to the design conversation that produced this plan. Everything needed is here.
-> **Deliverable:** a portable Bash tool `paruz` (+ `paruz-setup` bootstrap) that hardens
+> **Status:** implemented. This document is the authoritative design and
+> **security-invariant reference** (§2, I1–I7) — code comments cite it as
+> `PLAN.md §N`. Keep it in sync when behavior changes; do not regress the
+> invariants.
+> **Scope:** a portable Bash tool `paruz` (+ `paruz-setup` bootstrap) that hardens
 > AUR install/upgrade on Arch Linux against supply-chain (maintainer-takeover) attacks,
 > while preserving `paru`/`pacman` muscle memory.
 
