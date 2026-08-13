@@ -36,7 +36,8 @@ optdepends=(
 	'bpf: eBPF rootkit-map IOC self-check (bpftool)'
 	'bat: nicer PKGBUILD/.install diff rendering in the gate'
 )
-makedepends=('git')
+# git is already in depends (runtime), so it's available at build too — no
+# separate makedepends needed for cloning the -git source.
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 options=('!strip')  # nothing to strip; pure Bash
