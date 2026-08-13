@@ -24,16 +24,79 @@ For AUR install/upgrade operations, paruz:
 
 Everything that isn't an AUR sync-install/upgrade passes straight through to `paru`.
 
+## Requirements
+
+- Arch Linux with `base-devel` and `devtools`.
+- An AUR helper — **paru** — and **[ks-aur-scanner](https://github.com/KiefStudioMA/ks-aur-scanner)**,
+  both from the AUR (bootstrap them once with plain paru or a hand-reviewed `makepkg -si`).
+  paruz orchestrates paru and uses ks-aur-scanner's `aur-scan` as its static-analysis gate.
+- `paruz-setup` installs the remaining dependencies (`jq`, `expac`, `bpf`, `flatpak`, …).
+
+## Installation
+
+**From the AUR** (once published):
+
+```sh
+paru -S paruz
+```
+
+**From source — build a pacman package (recommended):**
+
+```sh
+git clone https://github.com/jesse-osiecki/paruz.git
+cd paruz
+makepkg -si          # builds via the Makefile (runs the fast test tier as `make check`)
+```
+
+Installs a pacman-tracked package; remove later with `sudo pacman -R paruz-git`.
+
+**From source — without packaging:**
+
+```sh
+git clone https://github.com/jesse-osiecki/paruz.git
+cd paruz
+sudo make install    # installs under /usr (PREFIX overridable); undo with `sudo make uninstall`
+```
+
+## Setup & first use
+
+`paruz-setup` configures the build environment. It is idempotent and prompts before it
+touches any system file:
+
+```sh
+paruz-setup      # sets up the [aur] local repo + aurbuild chroot, reconciles
+                 # pacman.conf/paru.conf, installs deps, and offers to disable the
+                 # non-gating ks-aur-scanner shell integration so paruz's gate is authoritative
+paruz doctor     # verify every prerequisite is in place (fails loudly if not)
+```
+
+Then use it like paru/pacman — paruz hardens AUR install/upgrade and passes everything else
+straight through:
+
+```sh
+paruz -S <pkg>            # hardened AUR install — review the PKGBUILD / maintainer gate
+paruz -Syu                # hardened full upgrade: official repos -> AUR -> flatpak
+paruz -Ss <term>          # passthrough to paru unchanged
+paruz --dry-run -S <pkg>  # print the plan without building or installing
+```
+
+`paruz --help` lists the full flag set (`--fail-on`, `--allow-maintainer-change`,
+`--replay-hook`, `--no-flatpak`, `--no-ioc`, …).
+
+## Uninstall
+
+```sh
+paruz-setup --uninstall   # undo the build-environment setup (prompted, reversible)
+sudo pacman -R paruz-git  # or `sudo make uninstall` for a `make install`
+```
+
 ## Status
 
-Implemented per **[PLAN.md](./PLAN.md)** (the full, self-contained design: verified
-environment facts, the network-off build recipe, the scriptlet-split install, the gates,
-the IOC check, `paruz-setup`, security invariants, and the test plan).
-
-Run `paruz-setup` to bootstrap a machine, then `paruz doctor` to verify it. `tests/run.sh`
-runs the fast, non-privileged acceptance tests by default; `tests/run.sh --live` exercises
-the real chroot build / install / `paruz-setup` paths and needs interactive `sudo` — read
-it before running it, since it mutates real system state.
+Implemented and tagged **v0.1.0**. See **[PLAN.md](./PLAN.md)** for the full design
+(network-off build recipe, scriptlet-split install, the gates, the IOC check, security
+invariants I1–I7, and the test plan). `tests/run.sh` runs the fast, non-privileged
+acceptance tier; the live tier (real chroot builds/installs) runs in a disposable VM via
+`testrig/` rather than on your host.
 
 ## Honest limits
 
