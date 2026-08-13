@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # shellcheck shell=bash
-# lib/build.sh — isolated net-off chroot build, Recipe A (PLAN.md §6.3, §7)
+# lib/build.sh — network-off chroot build (PLAN.md §6.3, §7)
 #
-# Satisfies I1 (no untrusted PKGBUILD code on host), I2 (build phase has no
-# network), I3 (build env never sees secrets — we simply never bind-mount
-# $HOME/~/.ssh/~/.gnupg/agents; makechrootpkg/arch-nspawn do not either).
+# Satisfies I2 (the build()/package() phase has no network) and I3 (the build
+# never sees your secrets — nothing bind-mounts $HOME/~/.ssh/~/.gnupg;
+# makechrootpkg and arch-nspawn do not either).
+#
+# I1 is a documented residual (PLAN.md §10): source download+verify runs
+# `makepkg --verifysource` on the host, which sources the PKGBUILD (executes its
+# global scope). That happens only AFTER the §6.2 gate (aur-scan + your review)
+# approves the PKGBUILD, and makechrootpkg re-parses it on the host during the
+# build regardless — so doing the fetch inside the chroot would not actually
+# prevent host-side parsing, it would only duplicate it (and it broke PGP
+# verification, which only works against your host keyring).
 #
 # Sets/uses these globals after build_classify_deps: REPO_DEPS, AUR_DEP_NAMES,
 # UNRESOLVED_DEPS. Deliberately globals (not passed by value) — bash array
@@ -128,7 +136,8 @@ build_sync_copy() {
 }
 
 # build_provision_repo_deps COPYNAME — install official-repo deps into the
-# copy WITH network (I2 only constrains the build phase, not provisioning).
+# copy WITH network (I2 only constrains the build phase, not provisioning), so
+# the later network-off makechrootpkg finds them present and needs no network.
 build_provision_repo_deps() {
 	local copyname="$1"
 	(( ${#REPO_DEPS[@]} == 0 )) && return 0
@@ -136,96 +145,31 @@ build_provision_repo_deps() {
 	run sudo arch-nspawn "$AUR_CHROOT_ROOT/$copyname" pacman -Sy --needed --noconfirm "${REPO_DEPS[@]}"
 }
 
-# build_vcs_source_pkgs CLONEDIR — VCS client packages the source= array needs
-# to fetch (git/hg/svn/bzr/fossil). Many -git/-hg/etc. PKGBUILDs don't declare
-# these in makedepends (they assume the host has them), but a base-devel chroot
-# does not — and paruz fetches/extracts sources inside the chroot, so the tool
-# must be present there. Echoes one package per line.
-build_vcs_source_pkgs() {
-	local clonedir="$1" srcs pkgs=()
-	srcs=$(grep -E '^[[:space:]]*source(_[A-Za-z0-9_]+)?[[:space:]]*=' "$clonedir/.SRCINFO" 2>/dev/null || true)
-	grep -qE 'git\+|git://|\.git([[:space:]#]|$)' <<<"$srcs" && pkgs+=(git)
-	grep -qE 'svn\+|svn://' <<<"$srcs" && pkgs+=(subversion)
-	grep -qE 'hg\+' <<<"$srcs" && pkgs+=(mercurial)
-	grep -qE 'bzr\+' <<<"$srcs" && pkgs+=(breezy)
-	grep -qE 'fossil\+' <<<"$srcs" && pkgs+=(fossil)
-	(( ${#pkgs[@]} > 0 )) && printf '%s\n' "${pkgs[@]}"
-}
-
-# build_provision_vcs_tools COPYNAME CLONEDIR — install the VCS clients the
-# sources need into the copy (network ON), before fetching. They persist in the
-# copy for the later network-off build too (which re-extracts VCS sources).
-build_provision_vcs_tools() {
-	local copyname="$1" clonedir="$2"
-	local -a vcs
-	mapfile -t vcs < <(build_vcs_source_pkgs "$clonedir")
-	(( ${#vcs[@]} == 0 )) && return 0
-	log "$copyname: installing VCS source tool(s) into chroot (network ON): ${vcs[*]}"
-	run sudo arch-nspawn "$AUR_CHROOT_ROOT/$copyname" pacman -Sy --needed --noconfirm "${vcs[@]}"
-}
-
-# build_create_builduser COPYNAME — creates the 'builduser' account inside
-# the chroot copy, mirroring makechrootpkg's own prepare_chroot() exactly
-# (uid/gid match the invoking host user, so files written inside the chroot
-# land with correct host ownership). Needed because our provisioning phase
-# calls `runuser -u builduser` directly via arch-nspawn, BEFORE real
-# makechrootpkg — which normally creates this account itself — ever runs.
-# builduser doesn't pre-exist anywhere (not in the pristine root, not on any
-# host); makechrootpkg (re)creates it fresh on every invocation, so we must
-# too. Same on a real machine as in a VM — no chroot/host-specific branching.
-build_create_builduser() {
-	local copyname="$1"
-	local copy="$AUR_CHROOT_ROOT/$copyname"
-	local build_user="${SUDO_USER:-$(id -un)}" uid gid
-	uid=$(id -u "$build_user")
-	gid=$(id -g "$build_user")
-
-	log "$copyname: creating builduser in chroot copy (uid=$uid gid=$gid)"
-	run sudo sed -e '/^builduser:/d' -i "$copy/etc/passwd" "$copy/etc/shadow" "$copy/etc/group"
-	run sudo bash -c 'printf "builduser:x:%s:\n" "$1" >> "$2"' _ "$gid" "$copy/etc/group"
-	run sudo bash -c 'printf "builduser:x:%s:%s:builduser:/build:/bin/bash\n" "$1" "$2" >> "$3"' _ "$uid" "$gid" "$copy/etc/passwd"
-	run sudo bash -c 'printf "builduser:!!:%s::::::\n" "$(( $(date -u +%s) / 86400 ))" >> "$1"' _ "$copy/etc/shadow"
-
-	# makepkg working dirs owned by builduser (mirrors makechrootpkg's
-	# prepare_chroot). Without a writable BUILDDIR, makepkg aborts at startup
-	# ("no write permission for $BUILDDIR (/)") before it downloads anything,
-	# because it otherwise defaults BUILDDIR to the cwd (/). /srcdest and
-	# /startdir are bind-mount targets, so they are not created here.
-	run sudo install -d -o "$uid" -g "$gid" \
-		"$copy/build" "$copy/pkgdest" "$copy/srcpkgdest" "$copy/logdest"
-}
-
-# build_provision_sources COPYNAME CLONEDIR — fetch+verify sources into the
-# persistent host source pool, inside the chroot copy (I1 residual, §10):
-# avoids makechrootpkg's default on-host --verifysource parse. --holdver
-# pins VCS sources so the later network-off build doesn't need to "check
-# latest".
+# build_provision_sources CLONEDIR — download + verify sources on the HOST,
+# with network, as the invoking user, into the shared source pool, BEFORE the
+# network-off build. Running on the host (not in the chroot) is deliberate:
+# PGP signatures then verify against YOUR gpg keyring — exactly what
+# makechrootpkg's own download_sources does. VERIFICATION IS FULL — no
+# --skipinteg, no --skippgpcheck: a bad checksum, a bad signature, or an
+# unknown/missing key fails the build closed (that is the point of the tool).
+# --holdver only pins VCS sources so the later network-off re-verify won't try
+# to fetch "latest"; it does not weaken integrity.
+#
+# This sources the PKGBUILD (runs its global scope) on the host — the I1
+# residual (PLAN.md §10). It happens only after the §6.2 gate approved the
+# PKGBUILD, and makechrootpkg re-parses it on the host during the build anyway.
 build_provision_sources() {
-	local copyname="$1" clonedir="$2"
-	local build_user="${SUDO_USER:-$(id -un)}"
-
+	local clonedir="$1" build_user="${SUDO_USER:-$(id -un)}"
 	run sudo mkdir -p "$AUR_SRCPOOL"
-	# builduser's uid inside the chroot is the SAME uid as build_user on the
-	# host (no user-namespace remapping in arch-nspawn) — bind-mounted
-	# directories are seen with their real host ownership, so this is what
-	# actually makes /srcdest writable by builduser inside the chroot.
 	run sudo chown "$build_user:$build_user" "$AUR_SRCPOOL"
-
-	build_create_builduser "$copyname"
-	build_provision_vcs_tools "$copyname" "$clonedir"
-
-	log "$copyname: provisioning sources (network ON, inside chroot)"
-	# Run as builduser from /startdir (makepkg refuses a PKGBUILD outside the
-	# cwd — same reason makechrootpkg's _chrootbuild does `cd /startdir`).
-	# HOME/BUILDDIR/*DEST point at writable in-chroot dirs (created in
-	# build_create_builduser); SRCDEST is the bind-mounted host pool so the
-	# fetched sources persist for the later network-off build.
-	run sudo arch-nspawn "$AUR_CHROOT_ROOT/$copyname" \
-		--bind="$AUR_SRCPOOL:/srcdest" --bind="$clonedir:/startdir" -- \
-		runuser -u builduser -- bash -c 'cd /startdir || exit 1
-			exec env HOME=/build BUILDDIR=/build SRCDEST=/srcdest \
-				PKGDEST=/pkgdest SRCPKGDEST=/srcpkgdest LOGDEST=/logdest \
-				makepkg --verifysource --holdver'
+	log "downloading + verifying sources on the host (network ON, your gpg keyring)"
+	# makepkg refuses to run as root, so this runs as the invoking user (whose
+	# keyring holds the maintainer keys, like a normal `makepkg`/`paru` build).
+	if ! ( cd "$clonedir" && run env SRCDEST="$AUR_SRCPOOL" makepkg --verifysource --holdver ); then
+		die "source download/verification failed (see above). If it is an unknown PGP key, \
+import it (e.g. 'gpg --recv-keys <keyid>') and re-run — paruz verifies against your keyring, \
+it does not skip the check (I7)."
+	fi
 }
 
 # build_do_build COPYNAME CLONEDIR AUR_DEP_FILE... — the network-off build
@@ -233,6 +177,14 @@ build_provision_sources() {
 # makechrootpkg/arch-nspawn ever runs, so build()/package() have none.
 # AUR deps already built (this run or previously) are injected as files via
 # `-I` — no [aur] repo needs to be configured inside the chroot.
+#
+# makechrootpkg internally passes --skipinteg to the in-chroot build's makepkg
+# (that is a devtools default, not something paruz adds). It is NOT a weakening
+# here: the sources were already fully verified — checksums AND PGP — on the
+# host in build_provision_sources, and makechrootpkg's own host-side
+# download_sources re-verifies them against your keyring before the build.
+# --skipinteg only avoids a third, redundant re-hash during the sandboxed
+# extraction of already-verified sources.
 build_do_build() {
 	local copyname="$1" clonedir="$2"
 	shift 2
@@ -270,7 +222,7 @@ build_repo_add() {
 # Echoes the built package file path(s) on stdout, one per line.
 build_target() {
 	local pkgbase="$1" clonedir="$2"
-	assert_tools makechrootpkg arch-nspawn repo-add pacman arch-nspawn unshare
+	assert_tools makechrootpkg arch-nspawn repo-add pacman makepkg unshare
 
 	log "$pkgbase: classifying dependencies from .SRCINFO"
 	build_classify_deps "$clonedir"
@@ -287,7 +239,7 @@ build_target() {
 	local copyname="paruz-$pkgbase"
 	build_sync_copy "$copyname"
 	build_provision_repo_deps "$copyname"
-	build_provision_sources "$copyname" "$clonedir"
+	build_provision_sources "$clonedir"
 	build_do_build "$copyname" "$clonedir" "${aur_dep_files[@]}"
 
 	local -a pkgnames
