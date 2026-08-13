@@ -62,14 +62,19 @@ Wave-2 refinements that constrain the design:
 
 These are the contract. Any implementation choice is acceptable iff it preserves all of:
 
-- **I1 — No untrusted PKGBUILD code executes on the host.** All PKGBUILD parsing,
-  `prepare()`, `build()`, `package()` happen **inside the chroot**. Gates run **before**
-  any `makepkg` parse of the target. (Residual, see §10: `makechrootpkg`'s own on-host
-  `--verifysource` parse; paruz performs source/dep provisioning **inside the chroot** to
-  avoid it — see §6.4.)
-- **I2 — The build phase has no network.** Network is available only while *provisioning*
-  sources and dependencies (inside the chroot); the actual `build()`/`package()` run with
-  the network namespace stripped.
+- **I1 — No untrusted PKGBUILD code executes on the host (residual).** `prepare()`,
+  `build()`, `package()` happen **inside the chroot**, always **after** the §6.2 gate
+  approves the target. The residual (see §10): source download+verify runs `makepkg
+  --verifysource` on the **host** (so PGP signatures verify against your keyring), which
+  sources the PKGBUILD's global scope. This is unavoidable while building via
+  `makechrootpkg` — its own `download_sources()` parses the PKGBUILD on the host regardless
+  — so an in-chroot fetch would only duplicate the exposure, not remove it.
+- **I2 — The build phase has no network — by default.** `build()`/`package()` run with the
+  network namespace stripped (`unshare -n`), after sources+deps are provisioned. **Opt-in
+  exception:** a package that fetches its own build dependencies (cargo/go/npm/pip/…) cannot
+  build offline; paruz auto-detects this and offers (or `--allow-build-net` pre-approves) a
+  **networked** build. That build is still chroot- and secret-isolated (I3), gated (I5), and
+  installed `--noscriptlet` (I4) — but it is a conscious, per-package waiver of I2 (§6.3).
 - **I3 — The build env never exposes secrets.** No bind mount of `$HOME`, `~/.ssh`,
   `~/.gnupg`, `~/.config`, cloud/token files, SSH agent, GPG agent into the build. Assert
   this explicitly; `makechrootpkg` already does not mount them — never add binds that do.
@@ -295,50 +300,42 @@ All three must pass (or be explicitly overridden where allowed) before build.
 
 ### 6.3–6.4 already covered above; details:
 
-### 6.3 Isolated build (`lib/build.sh`) — satisfies I1, I2, I3
+### 6.3 Isolated build (`lib/build.sh`) — satisfies I2, I3 (I1 residual per §10)
 
-**Invariants restated:** sources + all build/runtime deps must be present **before** the
-network is removed; `build()`/`package()` run with **no network**; no secrets bind-mounted.
+**As implemented.** Per package, with a **dedicated working copy** `paruz-<pkgbase>`, a
+persistent host source pool `SRCDEST=/var/lib/paruz/srcdest`, and `PKGDEST=/var/lib/repo/aur`:
 
-**Recommended recipe (Recipe A — chroot + `unshare -n`):** per package, in its clone dir,
-with a **dedicated working copy** `paruz-<pkgbase>` and a persistent host source pool
-`SRCPOOL=/var/lib/paruz/srcdest`, `PKGDEST=/var/lib/repo/aur`:
+1. **Sync a fresh working copy** from the pristine root (`btrfs subvolume snapshot` on btrfs,
+   else `cp -a --reflink=auto /var/lib/aurbuild/root → copy`).
+2. **Classify deps** from `.SRCINFO` (`build_classify_deps`), against what the **fresh chroot**
+   needs (not the host's installed set): official-repo → `REPO_DEPS`; `[aur]` / AUR → built
+   first and injected via `makechrootpkg -I <file>`; unresolved-but-in-AUR → the §7 fallback.
+3. **Decide the build's network mode** (`build_needs_build_net` + prompt / `--allow-build-net`):
+   - **net-off (default, I2).** Provision first, *with* network: install `REPO_DEPS` into the
+     copy (`arch-nspawn <copy> pacman -Sy --needed`), then **download+verify sources on the
+     host** as the invoking user (`makepkg --verifysource --holdver`) — on the host so PGP
+     signatures verify against **your gpg keyring**, exactly like `makechrootpkg`'s own
+     `download_sources`. Verification is **full** (checksums + PGP; no `--skipinteg`/
+     `--skippgpcheck`). Then build with the network namespace stripped:
+     `unshare -n -- makechrootpkg -r /var/lib/aurbuild -l paruz-<pkgbase> -I <aur-deps…> -- --holdver`.
+     Sources are cached and deps present, so `makechrootpkg`'s own `download_sources`/`--syncdeps`
+     need no network; `build()`/`package()` inherit the empty netns → **no network**.
+   - **net-on (opt-in, waives I2).** For packages that fetch build deps (cargo/go/npm/pip/…).
+     Skip the pre-provisioning and run `makechrootpkg … -I <aur-deps…> -- --holdver` **without**
+     `unshare -n`; `makechrootpkg` fetches sources+deps and verifies PGP itself (host, your
+     keyring), and `build()` has network. Still chroot- and secret-isolated (I3), gated (I5),
+     installed `--noscriptlet` (I4). A conscious per-package downgrade — see §2 I2.
+4. **Publish:** `makechrootpkg` writes `.pkg.tar.zst` to `PKGDEST`; then
+   `repo-add /var/lib/repo/aur/aur.db.tar.zst <files…>` (exact-pkgname match, skipping the
+   `-debug` package) and `sudo pacman -Sy`.
 
-1. **Sync a fresh working copy** from the pristine root (`makechrootpkg -c … -l paruz-<pkgbase>`
-   handles copy creation; or rsync/btrfs-snapshot `/var/lib/aurbuild/root` → copy).
-2. **Provision (network ON), inside the chroot** — never on the host:
-   - Repo deps: parse `.SRCINFO` `depends`/`makedepends`/`checkdepends`; install the
-     official-repo ones into the copy: `arch-nspawn "<copy>" pacman -Sy --needed --noconfirm <repo-deps>`.
-   - AUR deps (already built earlier this run): inject as files at build time via
-     `makechrootpkg -I /var/lib/repo/aur/<dep>-*.pkg.tar.zst …` (installs into the copy via
-     `pacman -U`; no chroot `[aur]` config needed).
-   - Sources: fetch+verify **inside** the copy into the bind-mounted pool, e.g.
-     `arch-nspawn "<copy>" --bind="$SRCPOOL:/srcdest" -- runuser -u builduser -- \
-        env SRCDEST=/srcdest makepkg -p /startdir/PKGBUILD --verifysource --holdver`.
-     `--holdver` prevents VCS "fetch latest" so a later net-off re-verify won't need the net.
-3. **Build (network OFF)** reusing the provisioned copy (do **not** pass `-c`):
-   ```bash
-   sudo unshare -n -- bash -c '
-     ip link set lo up 2>/dev/null   # some test suites need loopback
-     exec env SRCDEST="'"$SRCPOOL"'" PKGDEST="/var/lib/repo/aur" \
-       makechrootpkg -r /var/lib/aurbuild -l "paruz-'"$pkgbase"'" \
-         -I <aur-dep pkgs…> -- --holdver --nocheck? '   # see note on --nocheck below
-   ```
-   With sources cached + deps present + `--holdver`, `makechrootpkg`'s own
-   `download_sources` and `--syncdeps` need no network; the `arch-nspawn` build inherits the
-   empty netns → **`build()`/`package()` have no network**.
-   - *Note on tests:* `check()` sometimes needs network; default to running it offline and,
-     on failure that looks network-related, either surface it or allow an opt-in
-     `--allow-check-net` that re-runs only `check()` networked (document the tradeoff). Keep
-     the default **offline**.
-4. **Publish:** `makechrootpkg` writes the `.pkg.tar.zst` to `PKGDEST`
-   (`/var/lib/repo/aur`); then `repo-add /var/lib/repo/aur/aur.db.tar.zst <pkg>` and
-   `sudo pacman -Sy` (refresh only the `[aur]` db — acceptable; it's the local file repo).
-
-**Alternative (Recipe B):** shadow `arch-nspawn` on `PATH` with a wrapper that injects
-`--private-network` for the build call only (leaving `makechrootpkg`'s host-side
-`download_sources` networked). Simpler orchestration, but relies on PATH-shadowing and
-still requires deps pre-installed. Recipe A is preferred for auditability.
+> **Why host-side verify, not in-chroot?** An earlier design ran `--verifysource` inside the
+> chroot to keep the PKGBUILD parse off the host. It bought nothing — `makechrootpkg`'s own
+> `download_sources` parses the PKGBUILD on the host regardless (§10 residual) — and it broke
+> PGP verification (empty chroot keyring; GnuPG's keyboxd doesn't share state across separate
+> `arch-nspawn` calls). Verifying on the host uses your keyring, like every normal `makepkg`
+> build. `makechrootpkg`'s internal `--skipinteg` for the in-chroot build is not a weakening:
+> sources are already fully verified on the host first.
 
 **AUR-dependency scope for v1 (see §7):** if a target has an **uninstalled AUR
 dependency**, v1 may either (a) resolve it recursively with the same pipeline (preferred if

@@ -14,7 +14,11 @@ For AUR install/upgrade operations, paruz:
 1. **Reads and gates** every PKGBUILD / `.install` / maintainer change before building
    (git-diff gate + AUR-RPC maintainer gate + `aur-scan` static analysis — **fail closed**).
 2. **Builds in a chroot with the network turned off** after sources/deps are provisioned,
-   so a build-time payload can't fetch a second stage or exfiltrate.
+   so a build-time payload can't fetch a second stage or exfiltrate. Packages that fetch
+   their own build dependencies (cargo/go/npm/pip/…) can't build offline; paruz detects
+   these and prompts to run a **networked** build instead — still chroot- and secret-
+   isolated, gated, and `--noscriptlet`-installed, but a conscious per-package waiver of the
+   network-off guarantee (`--allow-build-net` to pre-approve).
 3. **Installs on the host with `pacman -U --noscriptlet`** — the package's `.install`
    scriptlet never runs as root on your machine (libalpm hooks still run, so nothing
    normal breaks).

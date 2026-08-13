@@ -63,6 +63,10 @@ paruz-specific flags (stripped before delegating passthrough ops):
   --allow-scan-findings        pre-approve aur-scan findings at/above --fail-on
                                 (skips the interactive override prompt; for
                                 non-interactive use — fails closed without it)
+  --allow-build-net            build WITH network (waives I2) without the
+                                auto-detect prompt — for packages that fetch
+                                deps at build time (cargo/go/npm/…); still
+                                chroot/secret-isolated, gated, --noscriptlet
   --replay-hook[=FN]           advisory sandbox replay of a scriptlet function
                                 (FN: pre_install|post_install|pre_upgrade|
                                 post_upgrade|pre_remove|post_remove)
@@ -135,6 +139,7 @@ REPLAY_HOOK=""
 CLI_FAIL_ON=""
 CLI_ALLOW_MAINTAINER_CHANGE=0
 CLI_ALLOW_SCAN_FINDINGS=0
+CLI_ALLOW_BUILD_NET=0
 CLI_SANDBOX=""
 CLI_NO_FLATPAK=0
 CLI_NO_IOC=0
@@ -145,6 +150,7 @@ while (( $# > 0 )); do
 		--fail-on=*) CLI_FAIL_ON="${1#*=}"; shift ;;
 		--allow-maintainer-change) CLI_ALLOW_MAINTAINER_CHANGE=1; shift ;;
 		--allow-scan-findings) CLI_ALLOW_SCAN_FINDINGS=1; shift ;;
+		--allow-build-net) CLI_ALLOW_BUILD_NET=1; shift ;;
 		--replay-hook) REPLAY_HOOK="post_install"; shift ;;
 		--replay-hook=*) REPLAY_HOOK="${1#*=}"; shift ;;
 		--no-flatpak) CLI_NO_FLATPAK=1; shift ;;
@@ -162,6 +168,7 @@ export DRY_RUN
 [[ -n "$CLI_FAIL_ON" ]] && FAIL_ON="$CLI_FAIL_ON"
 (( CLI_ALLOW_MAINTAINER_CHANGE )) && ALLOW_MAINTAINER_CHANGE=1
 (( CLI_ALLOW_SCAN_FINDINGS )) && ALLOW_SCAN_FINDINGS=1
+(( CLI_ALLOW_BUILD_NET )) && ALLOW_BUILD_NET=1
 [[ -n "$CLI_SANDBOX" ]] && SANDBOX="$CLI_SANDBOX"
 (( CLI_NO_FLATPAK )) && FLATPAK=0
 (( CLI_NO_IOC )) && IOC=0
@@ -275,10 +282,12 @@ op_install() {
 	local -a targets=("$@") repo_targets=() aur_targets=()
 	local t repo
 	for t in "${targets[@]}"; do
-		# pacman -Si exits non-zero for AUR (non-repo) targets; the trailing
-		# `|| true` keeps that expected failure from tripping `set -o pipefail`
-		# + `set -e`. Empty $repo => treat as an AUR target.
-		repo=$(pacman -Si "$t" 2>/dev/null | awk -F': ' '/^Repository/{print $2; exit}') || true
+		# Resolve the target's repo, HANDLING PROVIDES (pacman -Si does not:
+		# e.g. `paruz -S cargo` should install the official `rust`, not try to
+		# build "cargo" from the AUR). Empty/`aur` => hardened AUR path; any
+		# other repo => install normally via paru. `|| true` keeps the expected
+		# non-zero for AUR/unknown names from tripping set -o pipefail + set -e.
+		repo=$(pacman -Sddp --print-format '%r' "$t" 2>/dev/null | head -1) || true
 		if [[ -n "$repo" && "$repo" != "aur" ]]; then
 			repo_targets+=("$t")
 		else

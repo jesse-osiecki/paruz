@@ -35,6 +35,23 @@ build_pkgnames() {
 	awk -F'= ' '/^pkgname = /{print $2}' "$clonedir/.SRCINFO"
 }
 
+# build_needs_build_net CLONEDIR — heuristic: does this package fetch its own
+# dependencies at BUILD time (cargo/go/npm/pip/…)? Such builds can't run under
+# the network-off model (I2); paruz offers a networked (still chroot/secret-
+# isolated) build for them. Heuristic, so it can miss or over-match — it only
+# drives an offer, and --allow-build-net / a declined prompt override it.
+build_needs_build_net() {
+	local clonedir="$1"
+	local srcinfo="$clonedir/.SRCINFO" pkgbuild="$clonedir/PKGBUILD"
+	# makedepends/depends that imply an online build-dep fetcher
+	grep -qE '^[[:space:]]*(make)?depends([_[:alnum:]]*)?[[:space:]]*=[[:space:]]*(cargo|rust|rustup|go|nodejs|npm|yarn|pnpm|bun|deno|python-pip|python-installer|dotnet-sdk|dotnet-runtime|stack|cabal-install)([[:space:]<>=].*)?$' \
+		"$srcinfo" 2>/dev/null && return 0
+	# build-time fetch commands in the PKGBUILD itself
+	grep -qE '\b(cargo[[:space:]]+(fetch|build|install|update|test)|go[[:space:]]+(build|get|mod|install|run)|GOPROXY|GOFLAGS|npm[[:space:]]+(ci|install|i)\b|yarn([[:space:]]+install)?|pnpm[[:space:]]+(install|i)\b|pip[[:space:]]+install|bun[[:space:]]+install|dotnet[[:space:]]+(restore|build|publish))' \
+		"$pkgbuild" 2>/dev/null && return 0
+	return 1
+}
+
 # build_latest_repo_file NAME — newest package file in the local [aur] repo
 # whose pkgname is EXACTLY NAME, or empty if none. A glob like "${name}-*"
 # is not enough: it also matches "${name}-debug-..." (makepkg emits a debug
@@ -58,28 +75,32 @@ build_latest_repo_file() {
 	[[ -n "$newest" ]] && printf '%s\n' "$newest"
 }
 
-# build_classify_deps CLONEDIR — per §7: pacman -Sp/-Si succeeds and repo is
-# not 'aur' => REPO_DEPS; repo is 'aur' => AUR_DEP_NAMES (already built,
-# resolvable from the local file repo); not resolvable at all (and not
-# already installed) => UNRESOLVED_DEPS, handled by build_handle_unresolved.
+# build_classify_deps CLONEDIR — split .SRCINFO deps into: REPO_DEPS (official
+# repos, pre-installed into the chroot for the net-off build); AUR_DEP_NAMES
+# (already built into the local [aur] repo, injected via `makechrootpkg -I`);
+# UNRESOLVED_DEPS (not in any sync db — an unbuilt AUR dep or truly missing,
+# handled by build_handle_unresolved).
+#
+# Resolution uses `pacman -Sddp --print-format '%r %n'`, which RESOLVES PROVIDES
+# / virtual packages (cargo->rust, sh->bash, awk->gawk, java-runtime->jre...) —
+# `pacman -Si` does not, and mis-classifying those as "missing" was killing real
+# builds. `-Sdd` resolves only the target itself, not its transitive deps. We
+# classify against what the FRESH chroot needs, independent of the host's
+# installed set (a host-installed dep is still absent from the clean copy).
 build_classify_deps() {
-	local clonedir="$1" dep repository
+	local clonedir="$1" dep resolved repo name
 	REPO_DEPS=(); AUR_DEP_NAMES=(); UNRESOLVED_DEPS=()
 	while IFS= read -r dep; do
 		[[ -z "$dep" ]] && continue
-		if pacman -Qq "$dep" >/dev/null 2>&1; then
-			continue
-		fi
-		# pacman -Si exits non-zero for AUR deps; `|| true` prevents that
-		# expected failure from tripping `set -o pipefail` + `set -e`. Empty
-		# $repository => not in any repo (AUR dep or truly missing).
-		repository=$(pacman -Si "$dep" 2>/dev/null | awk -F': ' '/^Repository/{print $2; exit}') || true
-		if [[ -z "$repository" ]]; then
+		resolved=$(pacman -Sddp --print-format '%r %n' "$dep" 2>/dev/null | head -1) || resolved=""
+		repo=${resolved%% *}
+		name=${resolved##* }
+		if [[ -z "$resolved" ]]; then
 			UNRESOLVED_DEPS+=("$dep")
-		elif [[ "$repository" == "aur" ]]; then
-			AUR_DEP_NAMES+=("$dep")
+		elif [[ "$repo" == "aur" ]]; then
+			AUR_DEP_NAMES+=("$name")   # the actual [aur] pkg (dep may be a provide)
 		else
-			REPO_DEPS+=("$dep")
+			REPO_DEPS+=("$dep")        # official; pacman -S resolves the provide
 		fi
 	done < <(build_srcinfo_deps "$clonedir")
 }
@@ -158,10 +179,20 @@ build_provision_repo_deps() {
 # This sources the PKGBUILD (runs its global scope) on the host — the I1
 # residual (PLAN.md §10). It happens only after the §6.2 gate approved the
 # PKGBUILD, and makechrootpkg re-parses it on the host during the build anyway.
-build_provision_sources() {
-	local clonedir="$1" build_user="${SUDO_USER:-$(id -un)}"
+# build_ensure_srcpool — the shared source pool must exist and be writable by
+# the invoking user: makepkg writes sources there as that user in BOTH build
+# modes (net-off via build_provision_sources; net-on via makechrootpkg's own
+# download_sources). paruz-setup also sets this up, but a networked build skips
+# build_provision_sources, so make it certain here for every build.
+build_ensure_srcpool() {
+	local build_user="${SUDO_USER:-$(id -un)}"
 	run sudo mkdir -p "$AUR_SRCPOOL"
 	run sudo chown "$build_user:$build_user" "$AUR_SRCPOOL"
+}
+
+build_provision_sources() {
+	local clonedir="$1"
+	build_ensure_srcpool
 	log "downloading + verifying sources on the host (network ON, your gpg keyring)"
 	# makepkg refuses to run as root, so this runs as the invoking user (whose
 	# keyring holds the maintainer keys, like a normal `makepkg`/`paru` build).
@@ -172,22 +203,26 @@ it does not skip the check (I7)."
 	fi
 }
 
-# build_do_build COPYNAME CLONEDIR AUR_DEP_FILE... — the network-off build
-# (I2): the outer `unshare -n` strips the network namespace before
-# makechrootpkg/arch-nspawn ever runs, so build()/package() have none.
+# build_do_build NETMODE COPYNAME CLONEDIR AUR_DEP_FILE... — run makechrootpkg.
+# NETMODE=off (default, I2): the outer `unshare -n` strips the network namespace
+# before makechrootpkg/arch-nspawn runs, so build()/package() have no network.
+# NETMODE=on: no unshare — build()/package() have network (I2 explicitly waived,
+# see build_target); still chroot- and secret-isolated (I3), and makechrootpkg
+# fetches sources+deps and verifies PGP itself in this mode.
 # AUR deps already built (this run or previously) are injected as files via
 # `-I` — no [aur] repo needs to be configured inside the chroot.
 #
 # makechrootpkg internally passes --skipinteg to the in-chroot build's makepkg
-# (that is a devtools default, not something paruz adds). It is NOT a weakening
-# here: the sources were already fully verified — checksums AND PGP — on the
+# (a devtools default, not something paruz adds). In NETMODE=off it is NOT a
+# weakening: sources were already fully verified — checksums AND PGP — on the
 # host in build_provision_sources, and makechrootpkg's own host-side
-# download_sources re-verifies them against your keyring before the build.
-# --skipinteg only avoids a third, redundant re-hash during the sandboxed
-# extraction of already-verified sources.
+# download_sources re-verifies against your keyring before the build; --skipinteg
+# only avoids a third, redundant re-hash of already-verified sources. In
+# NETMODE=on, makechrootpkg's download_sources performs that same full host-side
+# verification (checksums + PGP) with network available.
 build_do_build() {
-	local copyname="$1" clonedir="$2"
-	shift 2
+	local netmode="$1" copyname="$2" clonedir="$3"
+	shift 3
 	local -a aur_dep_files=("$@")
 
 	local -a cmd=(env "SRCDEST=$AUR_SRCPOOL" "PKGDEST=$AUR_REPO_DIR" \
@@ -198,9 +233,14 @@ build_do_build() {
 	done
 	cmd+=(-- --holdver)
 
-	log "$copyname: building with network OFF (I2): ${cmd[*]}"
-	( cd "$clonedir" && run sudo unshare -n -- bash -c \
-		'ip link set lo up 2>/dev/null; exec "$@"' _ "${cmd[@]}" )
+	if [[ "$netmode" == on ]]; then
+		log "$copyname: building WITH network (I2 waived): ${cmd[*]}"
+		( cd "$clonedir" && run sudo -- "${cmd[@]}" )
+	else
+		log "$copyname: building with network OFF (I2): ${cmd[*]}"
+		( cd "$clonedir" && run sudo unshare -n -- bash -c \
+			'ip link set lo up 2>/dev/null; exec "$@"' _ "${cmd[@]}" )
+	fi
 }
 
 # build_repo_add PKGNAME... — repo-add the just-built package files and
@@ -238,9 +278,35 @@ build_target() {
 
 	local copyname="paruz-$pkgbase"
 	build_sync_copy "$copyname"
-	build_provision_repo_deps "$copyname"
-	build_provision_sources "$clonedir"
-	build_do_build "$copyname" "$clonedir" "${aur_dep_files[@]}"
+	build_ensure_srcpool   # makepkg needs a user-writable SRCDEST in both modes
+
+	# Decide the build's network mode. Default is off (I2). Packages that fetch
+	# their own build deps (cargo/go/npm/…) can't build offline, so paruz offers
+	# a networked build; --allow-build-net (ALLOW_BUILD_NET=1) pre-approves it.
+	local netmode=off
+	if [[ "${ALLOW_BUILD_NET:-0}" == 1 ]]; then
+		netmode=on
+		warn "$pkgbase: --allow-build-net set — building WITH network (I2 waived)"
+	elif build_needs_build_net "$clonedir"; then
+		warn "$pkgbase: this package fetches dependencies at build time (cargo/go/npm/pip/…),"
+		warn "which the default network-off build (I2) cannot do."
+		warn "A networked build stays chroot- and secret-isolated (I3), is still gated, and is"
+		warn "still installed with --noscriptlet + IOC-checked — but build()/package() WILL have"
+		warn "network, so a malicious build could fetch a payload into the (secret-free) sandbox."
+		if confirm "$pkgbase: build WITH network in the isolated chroot?" y; then
+			netmode=on
+		else
+			warn "$pkgbase: keeping the network-off build (it will likely fail for this package)"
+		fi
+	fi
+
+	if [[ "$netmode" == off ]]; then
+		# Net-off build needs sources + deps present beforehand (no network then).
+		build_provision_repo_deps "$copyname"
+		build_provision_sources "$clonedir"
+	fi
+	# In netmode=on, makechrootpkg fetches sources+deps and verifies PGP itself.
+	build_do_build "$netmode" "$copyname" "$clonedir" "${aur_dep_files[@]}"
 
 	local -a pkgnames
 	mapfile -t pkgnames < <(build_pkgnames "$clonedir")
