@@ -134,9 +134,22 @@ build_handle_unresolved() {
 		warn "Packages built WITH network for this reason: ${really_aur[*]}"
 		run command paru -S --noinstall --chroot --localrepo --noconfirm "${really_aur[@]}" \
 			|| die "networked fallback build failed for: ${really_aur[*]}"
-		run sudo pacman -Sy
+		build_refresh_aur_db
 		AUR_DEP_NAMES+=("${really_aur[@]}")
 	fi
+}
+
+# build_refresh_aur_db — refresh ONLY the local [aur] sync db, so pacman sees a
+# just-built package without `pacman -Sy` (which would also refresh the official
+# mirrors and leave the sync db ahead of the installed system — a partial-upgrade
+# footgun the next `pacman -S` could trip on, breaking the host). This copies the
+# local repo db into pacman's sync dir, which is exactly what `-Sy` does for a
+# file:// repo, minus the official refresh.
+build_refresh_aur_db() {
+	local dbpath syncdb
+	dbpath=$(pacman-conf DBPath 2>/dev/null) || dbpath=/var/lib/pacman/
+	syncdb="${dbpath%/}/sync/aur.db"
+	run sudo install -Dm644 "$AUR_REPO_DIR/aur.db" "$syncdb"
 }
 
 # build_sync_copy COPYNAME — (re)creates the chroot working copy from the
@@ -254,7 +267,7 @@ build_repo_add() {
 	done
 	(( ${#files[@]} > 0 )) || die "build produced no package file(s) for: ${pkgnames[*]}"
 	run sudo repo-add "$AUR_REPO_DIR/aur.db.tar.zst" "${files[@]}"
-	run sudo pacman -Sy
+	build_refresh_aur_db
 	printf '%s\n' "${files[@]}"
 }
 

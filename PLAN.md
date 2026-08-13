@@ -327,7 +327,9 @@ persistent host source pool `SRCDEST=/var/lib/paruz/srcdest`, and `PKGDEST=/var/
      installed `--noscriptlet` (I4). A conscious per-package downgrade — see §2 I2.
 4. **Publish:** `makechrootpkg` writes `.pkg.tar.zst` to `PKGDEST`; then
    `repo-add /var/lib/repo/aur/aur.db.tar.zst <files…>` (exact-pkgname match, skipping the
-   `-debug` package) and `sudo pacman -Sy`.
+   `-debug` package) and refresh **only** the `[aur]` sync db (copy the local repo db into
+   pacman's sync dir — NOT `pacman -Sy`, which would also refresh the official mirrors and
+   leave the db ahead of the installed system, a partial-upgrade footgun).
 
 > **Why host-side verify, not in-chroot?** An earlier design ran `--verifysource` inside the
 > chroot to keep the PKGBUILD parse off the host. It bought nothing — `makechrootpkg`'s own
