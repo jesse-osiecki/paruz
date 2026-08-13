@@ -27,12 +27,27 @@ build_pkgnames() {
 	awk -F'= ' '/^pkgname = /{print $2}' "$clonedir/.SRCINFO"
 }
 
-# build_latest_repo_file NAME — newest matching package file in the local
-# [aur] repo directory, or empty if none.
+# build_latest_repo_file NAME — newest package file in the local [aur] repo
+# whose pkgname is EXACTLY NAME, or empty if none. A glob like "${name}-*"
+# is not enough: it also matches "${name}-debug-..." (makepkg emits a debug
+# package) and prefix collisions like "${name}-something-...". A package
+# filename is pkgname-pkgver-pkgrel-arch.pkg.tar.zst where pkgver/pkgrel/arch
+# contain no dashes, so pkgname is the filename minus its last three
+# dash-fields; compare that to NAME exactly.
 build_latest_repo_file() {
-	local name="$1"
-	find "$AUR_REPO_DIR" -maxdepth 1 -name "${name}-*.pkg.tar.zst" -printf '%T@ %p\n' 2>/dev/null \
-		| sort -rn | head -1 | cut -d' ' -f2-
+	local name="$1" f base stem pkgname newest="" newest_t=0 t
+	for f in "$AUR_REPO_DIR"/*.pkg.tar.zst; do
+		[[ -e "$f" ]] || continue
+		base=${f##*/}
+		stem=${base%.pkg.tar.zst}   # pkgname-pkgver-pkgrel-arch
+		pkgname=${stem%-*}          # drop arch
+		pkgname=${pkgname%-*}       # drop pkgrel
+		pkgname=${pkgname%-*}       # drop pkgver
+		[[ "$pkgname" == "$name" ]] || continue
+		t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+		if (( t >= newest_t )); then newest_t=$t; newest="$f"; fi
+	done
+	[[ -n "$newest" ]] && printf '%s\n' "$newest"
 }
 
 # build_classify_deps CLONEDIR — per §7: pacman -Sp/-Si succeeds and repo is
@@ -121,6 +136,34 @@ build_provision_repo_deps() {
 	run sudo arch-nspawn "$AUR_CHROOT_ROOT/$copyname" pacman -Sy --needed --noconfirm "${REPO_DEPS[@]}"
 }
 
+# build_vcs_source_pkgs CLONEDIR — VCS client packages the source= array needs
+# to fetch (git/hg/svn/bzr/fossil). Many -git/-hg/etc. PKGBUILDs don't declare
+# these in makedepends (they assume the host has them), but a base-devel chroot
+# does not — and paruz fetches/extracts sources inside the chroot, so the tool
+# must be present there. Echoes one package per line.
+build_vcs_source_pkgs() {
+	local clonedir="$1" srcs pkgs=()
+	srcs=$(grep -E '^[[:space:]]*source(_[A-Za-z0-9_]+)?[[:space:]]*=' "$clonedir/.SRCINFO" 2>/dev/null || true)
+	grep -qE 'git\+|git://|\.git([[:space:]#]|$)' <<<"$srcs" && pkgs+=(git)
+	grep -qE 'svn\+|svn://' <<<"$srcs" && pkgs+=(subversion)
+	grep -qE 'hg\+' <<<"$srcs" && pkgs+=(mercurial)
+	grep -qE 'bzr\+' <<<"$srcs" && pkgs+=(breezy)
+	grep -qE 'fossil\+' <<<"$srcs" && pkgs+=(fossil)
+	(( ${#pkgs[@]} > 0 )) && printf '%s\n' "${pkgs[@]}"
+}
+
+# build_provision_vcs_tools COPYNAME CLONEDIR — install the VCS clients the
+# sources need into the copy (network ON), before fetching. They persist in the
+# copy for the later network-off build too (which re-extracts VCS sources).
+build_provision_vcs_tools() {
+	local copyname="$1" clonedir="$2"
+	local -a vcs
+	mapfile -t vcs < <(build_vcs_source_pkgs "$clonedir")
+	(( ${#vcs[@]} == 0 )) && return 0
+	log "$copyname: installing VCS source tool(s) into chroot (network ON): ${vcs[*]}"
+	run sudo arch-nspawn "$AUR_CHROOT_ROOT/$copyname" pacman -Sy --needed --noconfirm "${vcs[@]}"
+}
+
 # build_create_builduser COPYNAME — creates the 'builduser' account inside
 # the chroot copy, mirroring makechrootpkg's own prepare_chroot() exactly
 # (uid/gid match the invoking host user, so files written inside the chroot
@@ -169,6 +212,7 @@ build_provision_sources() {
 	run sudo chown "$build_user:$build_user" "$AUR_SRCPOOL"
 
 	build_create_builduser "$copyname"
+	build_provision_vcs_tools "$copyname" "$clonedir"
 
 	log "$copyname: provisioning sources (network ON, inside chroot)"
 	# Run as builduser from /startdir (makepkg refuses a PKGBUILD outside the
