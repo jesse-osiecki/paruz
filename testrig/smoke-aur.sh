@@ -100,16 +100,15 @@ warn "================================================================"
 
 # paruz_in_guest ARGS LOGFILE — run ./bin/paruz with the given args in the
 # guest over an SSH pty, feeding 'y' to any tty-gated confirm() prompt. Tees
-# to LOGFILE and returns paruz's exit code.
+# to LOGFILE and returns paruz's exit code. $PARUZ_EXTRA_FLAGS (host env) is
+# prepended to the paruz args — use it to pre-approve non-gate prompts (e.g.
+# --allow-build-net) so a run needs only the single gate 'y'; the pre-fed
+# pty input is not reliable across multiple prompts separated by long work.
 paruz_in_guest() {
 	local args="$1" logfile="$2" rc=0
-	# -tt forces a remote pty so paruz's confirm() (which fails closed on a
-	# non-tty) reads our answers. A bounded run of 'y' covers paruz's gate
-	# prompts; pacman installs run --noconfirm, so there are no pacman prompts
-	# to answer here (which is why a fixed count suffices, not a `yes` stream).
 	printf 'y\ny\ny\ny\ny\n' \
 		| ssh -tt "${SSH_OPTS[@]}" "$GUEST_USER@$ip" \
-			"cd '$GUEST_REPO_DIR' && ./bin/paruz $args" 2>&1 \
+			"cd '$GUEST_REPO_DIR' && ./bin/paruz ${PARUZ_EXTRA_FLAGS:-} $args" 2>&1 \
 		| tee "$logfile" \
 		|| rc=$?
 	return "$rc"
