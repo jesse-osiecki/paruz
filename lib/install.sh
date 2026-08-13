@@ -49,6 +49,11 @@ install_repo_deps() {
 # files with --noscriptlet (I4). Explicit targets keep default (explicit)
 # install reason; packages pulled in only as deps are marked --asdeps.
 install_aur_packages() {
+	# These are the local .pkg.tar.zst files paruz already gated and built, so
+	# the install is deterministic; --noconfirm is fine (a conflict here fails
+	# closed, which is acceptable). --noscriptlet is the security control (I4)
+	# and must stay. (The interactive path that matters — resolving upgrade
+	# conflicts — is the `pacman -Syu` in op_upgrade_full, not these installs.)
 	if (( ${#EXPLICIT_AUR_FILES[@]} > 0 )); then
 		log "installing explicit AUR target(s) WITHOUT scriptlets (I4): ${EXPLICIT_AUR_FILES[*]##*/}"
 		run sudo pacman -U --noscriptlet --noconfirm "${EXPLICIT_AUR_FILES[@]}"

@@ -85,6 +85,7 @@ pass() { ok "PASS  $*"; }
 fail() { err "FAIL  $*"; FAILED=1; }
 
 # pty runner: feeds 'y' to paruz's tty-gated gate (packaged binary on PATH).
+# Bounded feed for paruz's gate prompts; pacman installs run --noconfirm.
 paruz_pty() {
 	local args="$1" logfile="$2" rc=0
 	printf 'y\ny\ny\ny\ny\n' \

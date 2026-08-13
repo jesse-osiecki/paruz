@@ -96,6 +96,8 @@ warn "================================================================"
 
 paruz_in_guest() {
 	local args="$1" logfile="$2" rc=0
+	# Bounded 'y' feed over a pty for paruz's gate prompts; pacman installs run
+	# --noconfirm, so no pacman prompts need answering here.
 	printf 'y\ny\ny\ny\ny\n' \
 		| ssh -tt "${SSH_OPTS[@]}" "$GUEST_USER@$ip" \
 			"cd '$GUEST_REPO_DIR' && ./bin/paruz $args" 2>&1 \

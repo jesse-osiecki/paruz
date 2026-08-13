@@ -179,6 +179,34 @@ test_10_fail_closed() {
 	fi
 }
 
+# --- test 11: scan-findings override (default fails closed; flag proceeds) ---
+test_11_scan_override() {
+	local dir="$fixtures/dle-001-curl-pipe-bash"
+	if ! command -v aur-scan >/dev/null 2>&1; then
+		skip "11 scan-override" "aur-scan not on PATH"
+		return
+	fi
+
+	# (a) non-interactive, no pre-approval => confirm() defaults No => abort.
+	local rc=0
+	( FAIL_ON=critical WARN_ON=high ALLOW_SCAN_FINDINGS=0
+	  gate_static_scan "paruz-test-dle-001" "$dir" ) </dev/null >/tmp/paruz-test-11a.out 2>&1 || rc=$?
+	if (( rc == 0 )); then
+		report "11 scan-override" 1 "gate_static_scan did not fail closed on critical without override"
+		return
+	fi
+
+	# (b) ALLOW_SCAN_FINDINGS=1 pre-approves => proceeds past the same finding.
+	rc=0
+	( FAIL_ON=critical WARN_ON=high ALLOW_SCAN_FINDINGS=1
+	  gate_static_scan "paruz-test-dle-001" "$dir" ) </dev/null >/tmp/paruz-test-11b.out 2>&1 || rc=$?
+	if (( rc != 0 )); then
+		report "11 scan-override" 1 "gate_static_scan aborted even with ALLOW_SCAN_FINDINGS=1"
+		return
+	fi
+	report "11 scan-override" 0
+}
+
 # --- live tests (§11 tests 4,5,6,7,9) -------------------------------------
 
 live_setup_clonedir() {
@@ -275,6 +303,7 @@ test_2_install_escalates
 test_3_maintainer_hardstop
 test_8_passthrough
 test_10_fail_closed
+test_11_scan_override
 
 if (( LIVE )); then
 	echo

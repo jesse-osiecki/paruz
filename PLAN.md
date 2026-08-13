@@ -191,6 +191,8 @@ gate.
 
 - `--fail-on <level>` — static-scan gate threshold (default `critical`; warn at `high`).
 - `--allow-maintainer-change` — permit a maintainer change for this run (still shows diff).
+- `--allow-scan-findings` — pre-approve `aur-scan` findings at/above `--fail-on`, skipping
+  the interactive override prompt (for non-interactive use; fails closed without it).
 - `--replay-hook[=post_install|post_upgrade]` — deliberately replay a scriptlet in a
   cap-dropped, network-off `bwrap` sandbox (advisory only; prints a Wave-2 warning).
 - `--no-flatpak` / `--no-ioc` — skip those stages.
@@ -279,8 +281,15 @@ State dir: `${XDG_STATE_HOME:-~/.local/state}/paruz/approved/<pkgbase>/` holding
      `.install` file**, adds a **binary/blob source**, or changes a `source=`/checksum to a
      new host. Default answer is **No**.
 3. **Static scan:** `aur-scan scan "<clone>" --fail-on "$FAIL_ON"` (default `critical`).
-   Non-zero exit ⇒ **abort**. Additionally warn (don't auto-abort) on `high`. Print the
-   findings verbatim.
+   Print the findings verbatim. Non-zero exit ⇒ **stop** — but, like the diff gate, a
+   human who has reviewed the findings may **explicitly override**: an interactive run
+   prompts to override (default **No**); `--allow-scan-findings` (or `ALLOW_SCAN_FINDINGS=1`)
+   pre-approves for non-interactive use; a non-interactive run with no pre-approval **fails
+   closed** (I7). Rationale: several `aur-scan` rules false-positive on benign metadata
+   (e.g. flagging the string `sudo` in an `optdepends` description as "sudo in build
+   function"), so a hard, un-overridable abort would brick-wall many legitimate packages;
+   the override keeps the default fail-closed while giving a reviewer recourse. Additionally
+   warn (don't block) on `high`.
 
 All three must pass (or be explicitly overridden where allowed) before build.
 
@@ -456,6 +465,7 @@ annotated default. Keys:
 | `WARN_ON` | `high` | Warn-but-don't-block threshold. |
 | `SANDBOX` | `chroot` | Build backend (`chroot` \| `gvisor` [Phase 2]). |
 | `ALLOW_MAINTAINER_CHANGE` | `0` | Default hard-stop on maintainer change. |
+| `ALLOW_SCAN_FINDINGS` | `0` | Pre-approve scan findings at/above `FAIL_ON` (else interactive override; non-interactive fails closed). |
 | `FLATPAK` | `1` | Fold `flatpak update` into full upgrades. |
 | `IOC` | `1` | Run the IOC self-check. |
 | `ALLOW_CHECK_NET` | `0` | Allow networked `check()` re-run (weakens I2 for tests only). |

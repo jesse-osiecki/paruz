@@ -150,9 +150,13 @@ gate_diff() {
 	fi
 }
 
-# gate_static_scan PKGBASE CLONEDIR — `aur-scan scan --fail-on` is the hard
-# gate (I5); a separate non-fatal pass at WARN_ON surfaces lower-severity
-# findings without blocking.
+# gate_static_scan PKGBASE CLONEDIR — `aur-scan scan --fail-on` is the gate
+# (I5). Findings at/above the threshold stop the build, but — like the diff
+# gate — a human who has reviewed them may explicitly override: default is an
+# interactive confirmation (default No), `--allow-scan-findings` pre-approves
+# for non-interactive use, and a non-interactive shell with no pre-approval
+# still fails closed (I7). A separate non-fatal pass at WARN_ON surfaces
+# lower-severity findings without blocking.
 gate_static_scan() {
 	local pkgbase="$1" clonedir="$2"
 	local fail_on="${FAIL_ON:-critical}" warn_on="${WARN_ON:-high}"
@@ -164,7 +168,17 @@ gate_static_scan() {
 	out=$(aur-scan scan "$clonedir" --fail-on "$fail_on" 2>&1) || rc=$?
 	printf '%s\n' "$out" >&2
 	if (( rc != 0 )); then
-		die "$pkgbase: static scan found $fail_on+ severity findings — aborting (I5)"
+		warn "$pkgbase: static scan found $fail_on+ severity findings (above)."
+		warn "$pkgbase: some aur-scan rules false-positive on benign metadata (e.g. flagging the"
+		warn "  string 'sudo' in an optdepends description as 'sudo in build function'). Read the"
+		warn "  findings and the PKGBUILD before overriding."
+		if [[ "${ALLOW_SCAN_FINDINGS:-0}" == 1 ]]; then
+			warn "$pkgbase: --allow-scan-findings set — proceeding despite $fail_on findings"
+		elif confirm "$pkgbase: OVERRIDE these $fail_on scan findings and build anyway?" n; then
+			warn "$pkgbase: $fail_on scan findings overridden by explicit confirmation — proceeding"
+		else
+			die "$pkgbase: static scan found $fail_on+ severity findings — not overridden, aborting (I5)"
+		fi
 	fi
 
 	local warn_rc=0
@@ -172,7 +186,11 @@ gate_static_scan() {
 	if (( warn_rc != 0 )); then
 		warn "$pkgbase: static scan found $warn_on+ severity findings (see above) — review before proceeding"
 	fi
-	ok "$pkgbase: static scan passed at fail-on=$fail_on"
+	if (( rc == 0 )); then
+		ok "$pkgbase: static scan passed at fail-on=$fail_on"
+	else
+		ok "$pkgbase: static scan gate cleared by explicit override (findings were $fail_on+)"
+	fi
 }
 
 # gate_snapshot PKGBASE CLONEDIR MAINTAINER — records the approved commit +

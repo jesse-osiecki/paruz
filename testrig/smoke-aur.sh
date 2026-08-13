@@ -104,8 +104,9 @@ warn "================================================================"
 paruz_in_guest() {
 	local args="$1" logfile="$2" rc=0
 	# -tt forces a remote pty so paruz's confirm() (which fails closed on a
-	# non-tty) actually reads our answers. A generous run of 'y' covers the
-	# single first-install approval with margin.
+	# non-tty) reads our answers. A bounded run of 'y' covers paruz's gate
+	# prompts; pacman installs run --noconfirm, so there are no pacman prompts
+	# to answer here (which is why a fixed count suffices, not a `yes` stream).
 	printf 'y\ny\ny\ny\ny\n' \
 		| ssh -tt "${SSH_OPTS[@]}" "$GUEST_USER@$ip" \
 			"cd '$GUEST_REPO_DIR' && ./bin/paruz $args" 2>&1 \

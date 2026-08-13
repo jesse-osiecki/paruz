@@ -60,6 +60,9 @@ stock paru with no gating. See PLAN.md §4.
 paruz-specific flags (stripped before delegating passthrough ops):
   --fail-on <level>            aur-scan gate threshold (default: critical)
   --allow-maintainer-change    permit a maintainer change for this run
+  --allow-scan-findings        pre-approve aur-scan findings at/above --fail-on
+                                (skips the interactive override prompt; for
+                                non-interactive use — fails closed without it)
   --replay-hook[=FN]           advisory sandbox replay of a scriptlet function
                                 (FN: pre_install|post_install|pre_upgrade|
                                 post_upgrade|pre_remove|post_remove)
@@ -131,6 +134,7 @@ ARGS=()
 REPLAY_HOOK=""
 CLI_FAIL_ON=""
 CLI_ALLOW_MAINTAINER_CHANGE=0
+CLI_ALLOW_SCAN_FINDINGS=0
 CLI_SANDBOX=""
 CLI_NO_FLATPAK=0
 CLI_NO_IOC=0
@@ -140,6 +144,7 @@ while (( $# > 0 )); do
 		--fail-on) CLI_FAIL_ON="$2"; shift 2 ;;
 		--fail-on=*) CLI_FAIL_ON="${1#*=}"; shift ;;
 		--allow-maintainer-change) CLI_ALLOW_MAINTAINER_CHANGE=1; shift ;;
+		--allow-scan-findings) CLI_ALLOW_SCAN_FINDINGS=1; shift ;;
 		--replay-hook) REPLAY_HOOK="post_install"; shift ;;
 		--replay-hook=*) REPLAY_HOOK="${1#*=}"; shift ;;
 		--no-flatpak) CLI_NO_FLATPAK=1; shift ;;
@@ -156,6 +161,7 @@ export DRY_RUN
 
 [[ -n "$CLI_FAIL_ON" ]] && FAIL_ON="$CLI_FAIL_ON"
 (( CLI_ALLOW_MAINTAINER_CHANGE )) && ALLOW_MAINTAINER_CHANGE=1
+(( CLI_ALLOW_SCAN_FINDINGS )) && ALLOW_SCAN_FINDINGS=1
 [[ -n "$CLI_SANDBOX" ]] && SANDBOX="$CLI_SANDBOX"
 (( CLI_NO_FLATPAK )) && FLATPAK=0
 (( CLI_NO_IOC )) && IOC=0
@@ -245,7 +251,12 @@ op_upgrade_full() {
 	assert_environment
 	ioc_self_check 1
 	log "official-repo upgrade (signed, scriptlets ON)..."
-	run sudo pacman -Syu --noconfirm
+	# Interactive on purpose (no --noconfirm): a full system upgrade is where
+	# pacman's own prompts — conflicts, replacements, provider choices — matter
+	# most, and suppressing them turns a resolvable conflict (e.g. an orphaned
+	# package blocking an upgrade) into an unrecoverable abort. Package installs
+	# below stay --noconfirm; the upgrade is the one that must let the user answer.
+	run sudo pacman -Syu
 	aur_upgrade_targets
 	do_flatpak
 	ioc_self_check 0
